@@ -3,19 +3,11 @@ import asyncio
 import discord
 from discord.ext import commands
 from discord import app_commands
-import sqlite3
+#import sqlite3
 import aiosqlite # for the add paper command
 import os 
 import time
 from dotenv import load_dotenv
-import asyncio
-import discord
-from discord.ext import commands
-from discord import app_commands
-import sqlite3
-import aiosqlite # for the add paper command
-import os 
-import time
 
 #from requests import options
 # Initialize the bot
@@ -71,6 +63,19 @@ async def setup_database():
                 print("Batch column already exists.")
             else:
                 raise
+
+        
+
+        # SPEED IMPROVEMENT INDEXES
+        await db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_course_exam
+        ON papers(course_code, exam_type)
+        """)
+
+        await db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_course_code
+        ON papers(course_code)
+        """)
 
         await db.commit()
 
@@ -248,8 +253,11 @@ async def add_paper(
     file: discord.Attachment,
     batch: app_commands.Choice[str]
 ):
-    
+    course_code = course_code.upper()
+    course_name = course_name.title()
+
     await interaction.response.defer(ephemeral=True)
+
     if not interaction.user.guild_permissions.administrator:
         await interaction.followup.send(
             "❌ Only administrators can upload papers.",
@@ -257,31 +265,45 @@ async def add_paper(
         )
         return
 
-    if not file.filename.endswith(".pdf"):
+    # Read file
+    file_bytes = await file.read()
+
+    # Validate PDF
+    if (
+        not file.filename.lower().endswith(".pdf")
+        or file.content_type != "application/pdf"
+        or not file_bytes.startswith(b"%PDF")
+    ):
         await interaction.followup.send(
-            "❌ Only PDF files allowed.",
+            "❌ Only valid PDF files allowed.",
             ephemeral=True
         )
         return
 
+    # Create folders FIRST
     course_folder = os.path.join(PAPER_FOLDER, course_code)
     exam_folder = os.path.join(course_folder, exam_type.value)
     os.makedirs(exam_folder, exist_ok=True)
+
+    # Create file path
     file_name = f"{course_code}_SEM{semester}_{batch.value}_{int(time.time())}.pdf"
     file_path = os.path.join(exam_folder, file_name)
 
-    await file.save(file_path)
+    # Save file (ONLY ONCE)
+    with open(file_path, "wb") as f:
+        f.write(file_bytes)
 
+    # Save to DB
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO papers (course_code, course_name, semester, exam_type, file_path, batch) VALUES (?, ?, ?, ?, ?, ?)",
             (
-            course_code,
-            course_name,
-            semester,
-            exam_type.value,
-            file_path,
-            batch.value
+                course_code,
+                course_name,
+                semester,
+                exam_type.value,
+                file_path,
+                batch.value
             )
         )
         await db.commit()
@@ -290,7 +312,6 @@ async def add_paper(
         "✅ Paper uploaded successfully!",
         ephemeral=True
     )
-
 
 # Command for searching previous year question papers based on subject code, year, and exam name. It returns the matching papers as attachments in the response.
 @bot.tree.command(name="find_paper", description="Search question papers")
@@ -508,6 +529,47 @@ async def delete_paper(
     except asyncio.TimeoutError:
         await interaction.followup.send(
             "⌛ Deletion timed out.",
+            ephemeral=True
+        )
+
+#command to list all available courses in the database. It queries for distinct course codes and names and returns them in a formatted message. If the message exceeds Discord's character limit, it sends the list as a text file attachment instead.
+@bot.tree.command(name="courses", description="List all available courses along with their codes")
+async def list_courses(interaction: discord.Interaction):
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT DISTINCT course_code, course_name
+            FROM papers
+            ORDER BY course_code
+        """) as cursor:
+            results = await cursor.fetchall()
+
+    if not results:
+        await interaction.response.send_message(
+            "❌ No courses found.",
+            ephemeral=True
+        )
+        return
+
+    content = "📚 Available Courses\n\n"
+
+    for code, name in results:
+        content += f"{code} - {name}\n"
+
+    # If message too long, send as file
+    if len(content) > 1900:
+        with open("courses.txt", "w", encoding="utf-8") as f:
+            f.write(content)
+
+        await interaction.response.send_message(
+            file=discord.File("courses.txt"),
+            ephemeral=True
+        )
+
+        os.remove("courses.txt")
+    else:
+        await interaction.response.send_message(
+            content,
             ephemeral=True
         )
 
